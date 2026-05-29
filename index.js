@@ -1,6 +1,7 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { recognizeTable } = require('./utils/ocr');
 
@@ -20,6 +21,7 @@ const STATICS_FILE = path.join(__dirname, 'data', 'statics.json');
 let savedStatics = new Map();
 let cachedMembers = null;
 let lastMemberFetch = 0;
+let pendingChecks = new Map(); // хранилище: shortId -> { url, name }
 
 async function getMembers() {
   const now = Date.now();
@@ -65,7 +67,7 @@ function saveStatics() {
   }
 }
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   loadStatics();
   console.log(`Бот запущен: ${client.user.tag}`);
   console.log(`Канал для скринов: ${SCREENSHOT_CHANNEL_ID}`);
@@ -95,12 +97,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
   
   if (interaction.customId.startsWith('check_')) {
+    const shortId = interaction.customId.replace('check_', '');
+    const pending = pendingChecks.get(shortId);
+    
+    if (!pending) {
+      await interaction.reply({ content: '❌ Ошибка: скриншот не найден', flags: 64 });
+      return;
+    }
+    
     await interaction.message.edit({
       content: interaction.message.content,
       components: []
     });
     
-    await handleCheck(interaction);
+    await handleCheck(interaction, pending.url, pending.name);
+    pendingChecks.delete(shortId);
   }
 });
 
@@ -260,10 +271,19 @@ client.on('messageCreate', async (message) => {
   if (images.length === 0) return;
   
   for (const image of images) {
+    // Генерируем короткий уникальный ID (8 символов)
+    const shortId = crypto.randomBytes(4).toString('hex');
+    
+    // Сохраняем информацию о скриншоте
+    pendingChecks.set(shortId, {
+      url: image.url,
+      name: image.name
+    });
+    
     const row = new ActionRowBuilder()
       .addComponents(
         new ButtonBuilder()
-          .setCustomId(`check_${image.url}_${Date.now()}`)
+          .setCustomId(`check_${shortId}`)
           .setLabel(`🔍 Проверить: ${image.name}`)
           .setStyle(ButtonStyle.Primary)
       );
@@ -280,13 +300,10 @@ client.on('messageCreate', async (message) => {
   });
 });
 
-async function handleCheck(interaction) {
-  await interaction.reply({ content: '⏳ Проверяю...', flags: 64 });
+async function handleCheck(interaction, imageUrl, imageName) {
+  await interaction.reply({ content: `⏳ Проверяю: ${imageName}...`, flags: 64 });
   
   try {
-    const parts = interaction.customId.split('_');
-    const imageUrl = parts.slice(1, -1).join('_');
-    
     const imageBuffer = await downloadImage(imageUrl);
     const tableData = await recognizeTable(imageBuffer);
     
@@ -327,7 +344,7 @@ async function handleCheck(interaction) {
       });
     }
     
-    const embed = generateEmbed(results, interaction.user.tag);
+    const embed = generateEmbed(results, interaction.user.tag, imageName);
     await interaction.followUp({ embeds: [embed], flags: 64 });
     
   } catch (error) {
@@ -342,7 +359,7 @@ async function downloadImage(url) {
   return Buffer.from(buffer);
 }
 
-function generateEmbed(results, authorName) {
+function generateEmbed(results, authorName, fileName) {
   const total = results.length;
   const found = results.filter(r => r.savedFound || r.discordFound).length;
   const notFound = total - found;
@@ -350,7 +367,7 @@ function generateEmbed(results, authorName) {
   const foundInDiscord = results.filter(r => r.discordFound).length;
   
   const embed = new EmbedBuilder()
-    .setTitle('📋 Результат проверки статиков')
+    .setTitle(`📋 Результат проверки: ${fileName}`)
     .setColor(found === total ? 0x00FF00 : (found > 0 ? 0xFFA500 : 0xFF0000))
     .setDescription(`Проверено статиков: ${total}\nНайдено: ${found}\nНе найдено: ${notFound}`)
     .addFields(
