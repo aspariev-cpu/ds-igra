@@ -20,8 +20,6 @@ const STATICS_FILE = path.join(__dirname, 'data', 'statics.json');
 let savedStatics = new Map();
 let cachedMembers = null;
 let lastMemberFetch = 0;
-let checkQueue = [];
-let isProcessing = false;
 
 async function getMembers() {
   const now = Date.now();
@@ -74,7 +72,6 @@ client.once('ready', async () => {
   console.log(`Статиков в базе: ${savedStatics.size}`);
 });
 
-// Обработка кнопки регистрации
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isButton()) return;
   
@@ -98,11 +95,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
   
   if (interaction.customId.startsWith('check_')) {
+    await interaction.message.edit({
+      content: interaction.message.content,
+      components: []
+    });
+    
     await handleCheck(interaction);
   }
 });
 
-// Обработка модального окна
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isModalSubmit()) return;
   if (interaction.customId !== 'register_static_modal') return;
@@ -172,13 +173,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   
   await interaction.reply({ 
     content: replyText || 'Ничего не добавлено', 
-    ephemeral: true 
+    flags: 64
   });
   
   console.log(`📦 ${interaction.user.tag} добавил ${results.success.length} статиков`);
 });
 
-// Обработка сообщений
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   
@@ -247,11 +247,9 @@ client.on('messageCreate', async (message) => {
     }
   }
   
-  // Обработка скриншотов (добавляем в очередь)
   if (message.channel.id !== SCREENSHOT_CHANNEL_ID) return;
   if (!message.attachments.size) return;
   
-  // Проверяем все вложения
   const images = [];
   for (const [id, attachment] of message.attachments) {
     if (attachment.contentType?.startsWith('image/')) {
@@ -261,64 +259,39 @@ client.on('messageCreate', async (message) => {
   
   if (images.length === 0) return;
   
-  // Отправляем эфемерное сообщение с подтверждением
-  const replyMsg = await message.reply({
-    content: `📸 Найдено ${images.length} скриншотов. Добавляю в очередь проверки...`,
-    ephemeral: true
-  });
-  
-  // Добавляем в очередь
   for (const image of images) {
-    checkQueue.push({
-      attachment: image,
-      authorTag: message.author.tag,
-      channel: message.channel,
-      replyMsg: replyMsg
+    const row = new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId(`check_${image.url}_${Date.now()}`)
+          .setLabel(`🔍 Проверить: ${image.name}`)
+          .setStyle(ButtonStyle.Primary)
+      );
+    
+    await message.reply({
+      content: `📸 **${image.name}**\nНажмите на кнопку для проверки`,
+      components: [row]
     });
   }
   
-  // Запускаем обработку очереди
-  processQueue();
+  await message.reply({
+    content: `✅ Добавлено ${images.length} кнопок для проверки скриншотов`,
+    flags: 64
+  });
 });
 
-// Обработка очереди
-async function processQueue() {
-  if (isProcessing) return;
-  if (checkQueue.length === 0) return;
+async function handleCheck(interaction) {
+  await interaction.reply({ content: '⏳ Проверяю...', flags: 64 });
   
-  isProcessing = true;
-  
-  while (checkQueue.length > 0) {
-    const task = checkQueue.shift();
-    await processSingleCheck(task);
-    
-    // Пауза между проверками, чтобы не перегружать бота
-    if (checkQueue.length > 0) {
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-  }
-  
-  isProcessing = false;
-}
-
-async function processSingleCheck(task) {
   try {
-    const { attachment, authorTag, channel, replyMsg } = task;
+    const parts = interaction.customId.split('_');
+    const imageUrl = parts.slice(1, -1).join('_');
     
-    // Обновляем статус
-    await replyMsg.edit({
-      content: `⏳ Проверяю: ${attachment.name}... (осталось в очереди: ${checkQueue.length})`,
-      ephemeral: true
-    });
-    
-    const imageBuffer = await downloadImage(attachment.url);
+    const imageBuffer = await downloadImage(imageUrl);
     const tableData = await recognizeTable(imageBuffer);
     
     if (!tableData.length) {
-      await channel.send({
-        content: `❌ **${attachment.name}** — не удалось распознать таблицу`,
-        ephemeral: true
-      });
+      await interaction.followUp({ content: '❌ Ошибка: не удалось распознать таблицу', flags: 64 });
       return;
     }
     
@@ -354,15 +327,12 @@ async function processSingleCheck(task) {
       });
     }
     
-    const embed = generateEmbed(results, authorTag, attachment.name);
-    await channel.send({ embeds: [embed], ephemeral: true });
+    const embed = generateEmbed(results, interaction.user.tag);
+    await interaction.followUp({ embeds: [embed], flags: 64 });
     
   } catch (error) {
     console.error(error);
-    await task.channel.send({
-      content: `❌ Ошибка при обработке ${task.attachment.name}: ${error.message}`,
-      ephemeral: true
-    });
+    await interaction.followUp({ content: `❌ Ошибка: ${error.message}`, flags: 64 });
   }
 }
 
@@ -372,7 +342,7 @@ async function downloadImage(url) {
   return Buffer.from(buffer);
 }
 
-function generateEmbed(results, authorName, fileName) {
+function generateEmbed(results, authorName) {
   const total = results.length;
   const found = results.filter(r => r.savedFound || r.discordFound).length;
   const notFound = total - found;
@@ -380,7 +350,7 @@ function generateEmbed(results, authorName, fileName) {
   const foundInDiscord = results.filter(r => r.discordFound).length;
   
   const embed = new EmbedBuilder()
-    .setTitle(`📋 Результат проверки: ${fileName}`)
+    .setTitle('📋 Результат проверки статиков')
     .setColor(found === total ? 0x00FF00 : (found > 0 ? 0xFFA500 : 0xFF0000))
     .setDescription(`Проверено статиков: ${total}\nНайдено: ${found}\nНе найдено: ${notFound}`)
     .addFields(
